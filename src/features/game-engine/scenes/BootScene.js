@@ -18,14 +18,22 @@ export default class BootScene extends Phaser.Scene {
     // Background scene Episode 1 - koridor sekolah
     this.load.image('episode1-bg', '/scenes/episode-1-corridor.png');
 
-    this.load.spritesheet(
-      'player-walk-sheet',
-      '/sprites/player/spritesheets/walk_spritesheet.png',
-      {
-        frameWidth: 254,
-        frameHeight: 598,
-      },
-    );
+    // Sprite karakter: setiap pose disimpan sebagai file gambar terpisah,
+    // dikelompokkan per folder animasi (idle/, walk/), bukan satu
+    // spritesheet gabungan. Supaya gampang diganti/ditambah pose satu-satu
+    // tanpa perlu re-export spritesheet, dan gampang nambah folder baru
+    // (mis. talk/, blink/) mengikuti pola yang sama nanti.
+    this.load.image('player-idle', '/sprites/player/idle/idle.png');
+    this.load.image('player-walk-1', '/sprites/player/walk/walk_1.png');
+    this.load.image('player-walk-2', '/sprites/player/walk/walk_2.png');
+    this.load.image('player-walk-3', '/sprites/player/walk/walk_3.png');
+
+    this.load.image('player-run-1', '/sprites/player/run/run_1.png');
+    this.load.image('player-run-2', '/sprites/player/run/run_2.png');
+    this.load.image('player-run-3', '/sprites/player/run/run_3.png');
+    this.load.image('player-run-4', '/sprites/player/run/run_4.png');
+    this.load.image('player-run-5', '/sprites/player/run/run_5.png');
+    this.load.image('player-run-6', '/sprites/player/run/run_6.png');
   }
 
   async create() {
