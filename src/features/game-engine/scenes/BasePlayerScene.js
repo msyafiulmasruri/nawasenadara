@@ -1,0 +1,1117 @@
+import Phaser from 'phaser';
+import {
+  WORLD_WIDTH,
+  WORLD_HEIGHT,
+  LEVEL_WIDTH,
+  LEVEL_EDGE_MARGIN,
+} from '../config/gameConfig';
+import { resetProgress } from '../utils/progressStore';
+import { getSettings, setMuted } from '../utils/settingsStore';
+import {
+  getVisibleBounds,
+  pxToWorld,
+  isPortrait,
+  syncGameSizeToOrientation,
+} from '../utils/visibleBounds';
+import AudioManager from '../audio/AudioManager';
+import { stopMenuBGM } from '../audio/menuAudio';
+
+const WALK_SPEED = 150;
+const RUN_SPEED = 260;
+const JUMP_HEIGHT = 90;
+const JUMP_DURATION = 480;
+
+// Scene dasar berisi seluruh logic gerakan karakter (walk/run/jump,
+// keyboard + touch control) yang dipakai bersama oleh Episode1Scene dan
+// PlaceholderEpisodeScene, supaya tidak ada kode gerakan yang
+// dobel-tulis di banyak file. Episode/scene turunan cukup meng-override
+// `createBackground()` untuk menentukan tampilan latar masing-masing,
+// dan boleh menambah logic sendiri di `onSceneUpdate()` (dipanggil tiap
+// frame dari update() bawaan kelas ini).
+export default class BasePlayerScene extends Phaser.Scene {
+  create(data) {
+    const height = WORLD_HEIGHT;
+
+    this.groundY = height - 120;
+
+    // Orientasi ditentukan SEKALI di awal scene ini dibuat (bukan tiap
+    // frame), lalu dipakai untuk memutuskan mode background & scrolling:
+    // - Portrait -> level lebar (LEVEL_WIDTH), background tile berulang,
+    //   kamera mengikuti karakter (side-scroll).
+    // - Landscape -> level = satu layar, background statis penuh satu
+    //   gambar (tanpa diulang), kamera diam di tempat.
+    // Kalau device diputar di tengah permainan (orientasi kategori
+    // berubah), scene ini di-restart otomatis supaya seluruh bounds,
+    // background, dan posisi kamera dibangun ulang dengan benar —
+    // lebih aman & sederhana daripada mencoba re-hitung semuanya secara
+    // live sambil tetap berjalan.
+    this._isPortraitMode = isPortrait(this);
+
+    // --- Fix crop atas/bawah di landscape ---
+    // Lihat dokumentasi lengkap di syncGameSizeToOrientation()
+    // (utils/visibleBounds.js) — intinya: di landscape, lebar dunia
+    // game dihitung ulang supaya PERSIS menyamai rasio aspek layar saat
+    // ini (tinggi tetap WORLD_HEIGHT=720, jadi posisi vertikal karakter
+    // groundY di bawah TIDAK terpengaruh sama sekali), sehingga ENVELOP
+    // tidak perlu meng-crop sisi manapun. Portrait dikembalikan ke
+    // ukuran referensi baku 1280x720 (crop kiri-kanan di sana memang
+    // disengaja untuk level yang di-pan kamera, lihat
+    // _updatePortraitCamera() di bawah).
+    const { width } = syncGameSizeToOrientation(this);
+
+    // Dipakai oleh _onResize untuk mendeteksi perubahan rasio aspek
+    // landscape yang TIDAK mengubah kategori orientasi (masih sama-sama
+    // landscape) — misalnya saat masuk/keluar fullscreen. Address bar
+    // browser hilang saat fullscreen mengubah tinggi viewport tanpa
+    // mengubah orientasi, jadi rasio aspek bergeser padahal kategori
+    // "landscape" tetap sama. Tanpa deteksi ini, dunia game tetap
+    // memakai rasio LAMA (dari sebelum fullscreen) sehingga crop
+    // atas/bawah/kiri/kanan muncul lagi persis seperti sebelum di-fix.
+    this._lastAspect =
+      this.scale.parentSize.width / this.scale.parentSize.height;
+
+    this.levelWidth = this._isPortraitMode ? LEVEL_WIDTH : width;
+
+    // Latar belakang: ditentukan oleh scene turunan (Episode1Scene pakai
+    // gambar asli, PlaceholderEpisodeScene pakai warna polos + label).
+    //
+    // PENTING (portrait): scene turunan BOLEH menimpa this.levelWidth di
+    // dalam createBackground() kalau punya art asli — lihat catatan
+    // panjang di Episode1Scene.createBackground() soal kenapa lebar
+    // level portrait untuk Episode1 dihitung dari lebar ASLI gambar
+    // (non-distorsi), bukan konstanta LEVEL_WIDTH sembarang. Makanya
+    // createBackground() dipanggil DULU di sini, SEBELUM physics/camera
+    // bounds di bawah dibuat — supaya bounds itu memakai this.levelWidth
+    // yang sudah final (baik dari override scene turunan, atau default
+    // LEVEL_WIDTH kalau tidak ada art asli, mis. PlaceholderEpisodeScene).
+    this.createBackground(width, height);
+
+    // Dunia fisika dibuat selebar level (karakter tidak bisa jalan
+    // keluar dari 0..levelWidth).
+    this.physics.world.setBounds(0, 0, this.levelWidth, height);
+
+    // Spawn TIDAK di x=0 — pakai margin aman yang sama dengan titik
+    // "selesai episode" di ujung satunya, supaya karakter dari awal
+    // muncul sudah berada di area yang pasti terlihat, bukan mepet ke
+    // tepi persis.
+    //
+    // Kalau ada data.preservePlayer (dikirim oleh scene.restart() saat
+    // device diputar), pakai posisi X itu supaya karakter tidak
+    // "meloncat" balik ke titik spawn tiap kali orientasi berubah.
+    // Diclamp ke batas level yang BARU, karena lebar level portrait
+    // (LEVEL_WIDTH, side-scroll) dan landscape (WORLD_WIDTH, satu
+    // layar) berbeda — kalau karakter sedang jauh di tengah level lebar
+    // portrait lalu diputar ke landscape (level jadi satu layar penuh),
+    // posisi X-nya perlu disesuaikan supaya tetap berada di dalam level
+    // baru yang lebih sempit, bukan malah keluar batas dunia.
+    const preserved = data?.preservePlayer;
+    const maxSpawnX = this.levelWidth - LEVEL_EDGE_MARGIN;
+    const spawnX =
+      preserved != null
+        ? Phaser.Math.Clamp(preserved.x, LEVEL_EDGE_MARGIN, maxSpawnX)
+        : LEVEL_EDGE_MARGIN;
+
+    this.player = this.physics.add.sprite(spawnX, this.groundY, 'player-idle');
+    this.player.setOrigin(0.5, 1);
+    this.player.setDepth(1);
+    this.player.setCollideWorldBounds(true);
+    if (preserved?.facingLeft) {
+      this.player.setFlipX(true);
+    }
+
+    // --- Kamera portrait: PAN MANUAL, bukan Camera.startFollow() ---
+    // startFollow() bawaan Phaser meng-clamp scroll berdasarkan lebar
+    // VIEWPORT KAMERA PENUH (WORLD_WIDTH/lebar dunia, 1280), bukan
+    // lebar area yang BENAR-BENAR terlihat di layar setelah di-crop
+    // ENVELOP (visBounds.width, jauh lebih sempit di portrait). Kalau
+    // dipaksa pakai startFollow, kamera butuh "ruang gerak" ekstra
+    // (dulu coba diatasi dengan _cameraPad, lalu meregangkan/tile
+    // background) — TAPI solusi itu semua berujung merusak/mendistorsi
+    // gambar asli.
+    //
+    // Solusi yang benar: background TETAP natural, tidak direntangkan/
+    // di-tile sama sekali (lihat this.levelWidth override di
+    // Episode1Scene). Kamera di-scroll MANUAL tiap frame di update(),
+    // Kamera pan (_updatePortraitCamera, lihat method di bawah) sekarang
+    // dipakai UNIVERSAL untuk semua orientasi, bukan cuma portrait —
+    // kalau this.levelWidth <= lebar area yang terlihat (kasus umum di
+    // landscape ketika background natural lebih sempit/sama dengan
+    // layar), rumus clamp di dalamnya otomatis membuat minScroll ==
+    // maxScroll == 0, sehingga kamera diam sendiri tanpa perlu kode
+    // khusus di sini. Kalau levelWidth lebih lebar dari layar (baik
+    // karena artwork memang lebar, atau karena ekstensi tile kecil di
+    // sisa kanan — lihat Episode1Scene.createBackground), kamera akan
+    // otomatis mulai mem-pan begitu karakter mendekati tepi yang
+    // terlihat, persis skema yang tadinya cuma berlaku di portrait.
+    this.cameras.main.scrollX = 0;
+
+    const targetHeight = 240;
+    this.spriteScale = targetHeight / 400;
+    this.player.setScale(this.spriteScale);
+
+
+    // Catatan: animasi walk/run/jump TIDAK dibuat di sini lagi. Kalau
+    // dulu dibuat ulang tiap scene episode create(), Phaser cuma
+    // menerima pembuatan pertama karena this.anims itu global satu
+    // instance game — perubahan frameRate jadi terasa "tidak
+    // berpengaruh". Sekarang animasinya dibuat SEKALI di
+    // BootScene.create() lewat config/playerAnimations.js — kalau mau
+    // ubah kecepatan animasi, edit frameRate di file itu.
+
+    // --- Audio Manager (procedural, tanpa file eksternal) ---
+    // init() harus dipanggil dari konteks yang dipicu user interaction
+    // (klik/tap Start Story sebelumnya), supaya AudioContext tidak kena
+    // blokir kebijakan autoplay browser.
+    // Hentikan musik tema menu (kalau masih jalan dari Title/Menu/
+    // Settings) SEBELUM mulai BGM gameplay episode ini — supaya
+    // keduanya tidak pernah bertumpuk/terdengar bersamaan. Musik menu
+    // akan otomatis menyala lagi begitu pemain kembali ke MenuScene.
+    stopMenuBGM();
+
+    this.audioManager = new AudioManager();
+    this.audioManager.init();
+
+    // Terapkan preferensi volume SFX/BGM yang diatur pemain lewat
+    // SettingsScene (tersimpan di localStorage — lihat
+    // utils/settingsStore.js). Kalau pemain belum pernah membuka
+    // Settings, ini otomatis jatuh ke nilai default AudioManager.
+    const savedSettings = getSettings();
+    this.audioManager.setSFXVolume(savedSettings.sfxVolume);
+    this.audioManager.setBGMVolume(savedSettings.bgmVolume);
+
+    this.audioManager.startBGM();
+    this.isMuted = data?.preserveMuted ?? savedSettings.muted;
+    if (this.isMuted) {
+      this.audioManager.setMasterVolume(0);
+    }
+
+    // Daftarkan listener animasi footstep berbasis frame animasi Phaser.
+    // Dengan cara ini, SFX bunyi langkah kaki selalu sinkron dengan
+    // frame animasi — tidak tergantung frame rate game sama sekali.
+    // Frame "kaki turun" pada walk: frame ke-1 dan ke-3 (index 0 & 2).
+    // Frame "kaki turun" pada run : frame ke-1 dan ke-3 (index 0 & 2).
+    this._registerFootstepListeners();
+
+    // Pastikan AudioManager benar-benar berhenti & AudioContext ditutup
+    // saat pindah scene (episode lain / balik ke menu), supaya tidak ada
+    // BGM dobel menumpuk dan tidak menyisakan AudioContext yang terus
+    // hidup di background.
+    this.events.once('shutdown', () => {
+      this.audioManager?.destroy();
+      if (this._resizeDebounceTimer) clearTimeout(this._resizeDebounceTimer);
+      this.scale.off('resize', this._onResize);
+      document.removeEventListener(
+        'fullscreenchange',
+        this._onFullscreenChange,
+      );
+      document.removeEventListener(
+        'webkitfullscreenchange',
+        this._onFullscreenChange,
+      );
+    });
+
+    // --- Input keyboard: Arrow keys + WASD + Space untuk lompat ---
+    this.cursors = this.input.keyboard.createCursorKeys();
+    this.keysWASD = this.input.keyboard.addKeys({
+      up: Phaser.Input.Keyboard.KeyCodes.W,
+      left: Phaser.Input.Keyboard.KeyCodes.A,
+      down: Phaser.Input.Keyboard.KeyCodes.S,
+      right: Phaser.Input.Keyboard.KeyCodes.D,
+    });
+    this.jumpKey = this.input.keyboard.addKey(
+      Phaser.Input.Keyboard.KeyCodes.SPACE,
+    );
+    this.shiftKeyLeft = this.input.keyboard.addKey(
+      Phaser.Input.Keyboard.KeyCodes.SHIFT,
+    );
+
+    this.touchState = {
+      left: false,
+      right: false,
+      runToggle: false,
+      jumpRequested: false,
+    };
+    this.isJumping = false;
+    this.jumpLocksMovement = false;
+
+    this.createTouchControls(width, height);
+
+    // --- Menu jeda (pause) ---
+    this.isPaused = false;
+    this.pauseKey = this.input.keyboard.addKey(
+      Phaser.Input.Keyboard.KeyCodes.ESC,
+    );
+    this.createPauseButton(width, height);
+    this.createFullscreenButton(width, height);
+    this.createPauseMenu();
+
+    // Update ikon tombol fullscreen setiap kali status fullscreen browser
+    // berubah — baik lewat tombol ini, tombol Esc browser, atau gesture
+    // lain (mis. swipe-down di sebagian browser mobile).
+    this._onFullscreenChange = () => {
+      this._updateFullscreenIcon();
+      // Fullscreen change kadang tidak memicu event resize di semua
+      // browser. Refresh scale agar Phaser menghitung ulang transformasi
+      // canvas dan layout UI berdasarkan ukuran viewport fullscreen.
+      this.scale.refresh();
+      this._repositionUI();
+      this._lastAspect =
+        this.scale.parentSize.width / this.scale.parentSize.height;
+    };
+    document.addEventListener('fullscreenchange', this._onFullscreenChange);
+    document.addEventListener(
+      'webkitfullscreenchange',
+      this._onFullscreenChange,
+    );
+
+    // Posisikan elemen UI ke area yang benar-benar terlihat di layar
+    // (perlu karena mode ENVELOP bisa memotong tepi dunia game jika
+    // rasio aspek viewport tidak cocok 16:9). Dipanggil sekali saat
+    // create, lalu otomatis setiap viewport berubah ukuran.
+    //
+    // DEBOUNCE: saat device diputar (rotasi), browser mobile sering
+    // menembakkan beberapa event resize beruntun dengan ukuran
+    // SEMENTARA/transisi sebelum akhirnya settle ke ukuran final. Kalau
+    // kita langsung bereaksi ke tiap event itu, tombol sempat dihitung
+    // ulang pakai ukuran transisi yang salah -> tombol jadi tidak
+    // konsisten ukurannya / kelihatan "nyendat". Solusinya: tunggu jeda
+    // singkat (150ms) tanpa event baru sebelum benar-benar bereaksi.
+    this._resizeDebounceTimer = null;
+    this._onResize = () => {
+      if (this._resizeDebounceTimer) {
+        clearTimeout(this._resizeDebounceTimer);
+      }
+      this._resizeDebounceTimer = setTimeout(() => {
+        this._resizeDebounceTimer = null;
+        // Kalau kategori orientasi (portrait <-> landscape) berubah —
+        // mis. HP diputar — seluruh setup (bounds, background, kamera)
+        // perlu dibangun ulang dari nol. Restart scene ini adalah cara
+        // paling aman: lebih sederhana & minim bug dibanding mencoba
+        // menghitung ulang semuanya secara live sambil tetap berjalan.
+        const nowPortrait = isPortrait(this);
+        const nowAspect =
+          this.scale.parentSize.width / this.scale.parentSize.height;
+        // Kategori berubah (portrait <-> landscape, mis. device diputar)
+        // ATAU rasio aspeknya bergeser cukup jauh dari yang dipakai
+        // untuk membangun dunia game saat ini (mis. masuk/keluar
+        // fullscreen menghilangkan/memunculkan address bar browser,
+        // mengubah tinggi viewport tanpa mengubah kategori orientasi).
+        //
+        // PENTING: cek ini berlaku di KEDUA orientasi, bukan cuma
+        // landscape. Sejak syncGameSizeToOrientation() dibuat dinamis
+        // untuk portrait juga (lebar dunia portrait sekarang ikut
+        // rasio layar, bukan cuma baku 1280x720 lagi), toggle
+        // fullscreen sambil main di portrait JUGA mengubah rasio yang
+        // seharusnya dipakai dunia game — kalau tidak di-restart,
+        // levelWidth/background/kamera portrait jadi memakai rasio
+        // BASI dari sebelum fullscreen di-toggle (gejala: teks/UI
+        // sempat mereposisi lewat _repositionUI(), tapi background &
+        // batas level tetap dari perhitungan lama).
+        //
+        // Threshold 1.5% dipakai supaya goyangan sangat kecil (rounding,
+        // scrollbar muncul-hilang sesaat) tidak memicu restart terus-
+        // menerus — hanya perubahan yang benar-benar berarti secara
+        // visual yang direspons.
+        const aspectShifted =
+          Math.abs(nowAspect - this._lastAspect) / this._lastAspect > 0.015;
+        if (nowPortrait !== this._isPortraitMode || aspectShifted) {
+          // Simpan posisi & arah hadap karakter dulu sebelum restart,
+          // supaya begitu scene dibangun ulang, karakter muncul lagi
+          // persis di posisi terakhirnya (bukan balik ke titik spawn
+          // awal). episodeId juga ikut dibawa supaya episode 2-9 tidak
+          // ke-reset ke episode 2 setiap kali device diputar/masuk-keluar
+          // fullscreen.
+          this.scene.restart({
+            episodeId: this.episodeId,
+            preserveMuted: this.isMuted,
+            preservePlayer: {
+              x: this.player.x,
+              facingLeft: this.player.flipX,
+            },
+          });
+          return;
+        }
+        this._repositionUI();
+      }, 150);
+    };
+    this._repositionUI();
+    this.scale.on('resize', this._onResize);
+  }
+
+  // Ditimpa oleh scene turunan.
+  createBackground(_width, _height) {
+    // no-op default
+  }
+
+  // Ditimpa oleh scene turunan yang butuh logic tambahan tiap frame
+  // (mis. cek zona finish episode). Dipanggil di akhir update().
+  onSceneUpdate(_time, _delta) {
+    // no-op default
+  }
+
+  /**
+   * Daftarkan listener Phaser `animationupdate` pada sprite player.
+   * SFX footstep hanya di-trigger pada frame tertentu (frame "kaki turun")
+   * sehingga ritme bunyi selalu selaras dengan animasi,
+   * tanpa bergantung pada frame rate game.
+   */
+  _registerFootstepListeners() {
+    // Frame index kaki menyentuh tanah (0-based):
+    //   walk (5 frame): index 1 dan 3  → kaki kiri & kanan turun
+    //   run  (4 frame): index 1 dan 3  → kaki kiri & kanan turun
+    const WALK_FOOT_FRAMES = new Set([1, 3]);
+    const RUN_FOOT_FRAMES = new Set([1, 3]);
+
+    this.player.on('animationupdate', (anim, frame) => {
+      const idx = frame.index - 1; // Phaser frame.index dimulai dari 1
+      if (anim.key === 'walk' && WALK_FOOT_FRAMES.has(idx)) {
+        this.audioManager?.playFootstepWalk();
+      } else if (anim.key === 'run' && RUN_FOOT_FRAMES.has(idx)) {
+        this.audioManager?.playFootstepRun();
+      }
+    });
+  }
+
+  /**
+   * Hitung ukuran tombol sentuh (radius, jarak antar tombol, margin ke
+   * tepi layar, ukuran font) dalam CSS px yang konsisten, lalu
+   * dikonversi ke world unit lewat pxToWorld(). Dengan ini ukuran
+   * FISIK tombol di layar kira-kira sama besar di HP kecil, tablet,
+   * maupun desktop raksasa — tidak ikut menyusut/membesar mengikuti
+   * skala ENVELOP seperti sebelumnya (radius tetap 42 world unit yang
+   * jadi sangat kecil di layar HP landscape sempit).
+   *
+   * Breakpoint berdasarkan lebar viewport CSS px sebenarnya
+   * (this.scale.parentSize.width), supaya tetap responsif walau HP
+   * diputar antara portrait <-> landscape, termasuk HP landscape
+   * sekecil ~450px lebar.
+   */
+  _getButtonMetrics() {
+    const parentWidth = this.scale.parentSize.width;
+    let diameterPx;
+    let gapPx;
+    let marginPx;
+    let fontPx;
+
+    if (parentWidth <= 480) {
+      // HP landscape sempit (turun sampai ~450px)
+      diameterPx = 60;
+      gapPx = 10;
+      marginPx = 16;
+      fontPx = 14;
+    } else if (parentWidth <= 720) {
+      // HP landscape umum / tablet kecil
+      diameterPx = 72;
+      gapPx = 14;
+      marginPx = 22;
+      fontPx = 16;
+    } else {
+      // Tablet besar / desktop
+      diameterPx = 84;
+      gapPx = 18;
+      marginPx = 30;
+      fontPx = 18;
+    }
+
+    return {
+      radiusWorld: pxToWorld(this, diameterPx / 2),
+      gapWorld: pxToWorld(this, gapPx),
+      marginWorld: pxToWorld(this, marginPx),
+      fontWorld: pxToWorld(this, fontPx),
+    };
+  }
+
+  createTouchControls(width, height) {
+    const { radiusWorld, gapWorld, marginWorld, fontWorld } =
+      this._getButtonMetrics();
+    this._buttonMetrics = { radiusWorld, gapWorld, marginWorld, fontWorld };
+
+    const buttonY = height - marginWorld - radiusWorld;
+    const leftX = marginWorld + radiusWorld;
+    const rightX = leftX + radiusWorld * 2 + gapWorld;
+    const runX = width - marginWorld - radiusWorld;
+    const jumpX = runX - radiusWorld * 2 - gapWorld;
+
+    const makeButton = (x, y, label, onDown, onUp) => {
+      const circle = this.add.circle(x, y, radiusWorld, 0x1a1a2e, 0.55);
+      circle.setStrokeStyle(2, 0xffffff, 0.6);
+      circle.setScrollFactor(0);
+      circle.setDepth(10);
+      circle.setInteractive({ useHandCursor: true });
+
+      const text = this.add
+        .text(x, y, label, {
+          fontFamily: 'Silkscreen, monospace',
+          fontSize: `${fontWorld}px`,
+          color: '#ffffff',
+        })
+        .setOrigin(0.5)
+        .setScrollFactor(0)
+        .setDepth(11);
+
+      if (onDown) circle.on('pointerdown', onDown);
+      if (onUp) {
+        circle.on('pointerup', onUp);
+        circle.on('pointerout', onUp);
+      }
+
+      return { circle, text };
+    };
+
+    this.btnLeft = makeButton(
+      leftX,
+      buttonY,
+      '<',
+      () => {
+        this.touchState.left = true;
+      },
+      () => {
+        this.touchState.left = false;
+      },
+    );
+
+    this.btnRight = makeButton(
+      rightX,
+      buttonY,
+      '>',
+      () => {
+        this.touchState.right = true;
+      },
+      () => {
+        this.touchState.right = false;
+      },
+    );
+
+    this.btnRun = makeButton(runX, buttonY, 'RUN', () => {
+      this.touchState.runToggle = !this.touchState.runToggle;
+    });
+
+    this.btnJump = makeButton(jumpX, buttonY, 'JUMP', () => {
+      this.touchState.jumpRequested = true;
+    });
+  }
+
+  createPauseButton(width) {
+    // Tombol jeda kecil di pojok kanan atas — selalu terlihat, terpisah
+    // dari tombol gerak di bawah supaya tidak tertekan tidak sengaja.
+    // Ukuran & posisi dihitung dari CSS px yang konsisten (sama seperti
+    // tombol gerak), supaya tidak jadi terlalu kecil/besar di layar
+    // sempit maupun raksasa. Posisi awal di koordinat dunia game;
+    // _repositionUI() akan memindahkannya ke area yang benar-benar
+    // terlihat setiap resize/rotasi layar.
+    const pauseWPx = 52;
+    const pauseHPx = 40;
+    const pauseFontPx = 20;
+    this._pauseBtnSize = {
+      w: pxToWorld(this, pauseWPx),
+      h: pxToWorld(this, pauseHPx),
+      font: pxToWorld(this, pauseFontPx),
+    };
+
+    this._pauseBtn = this.add.rectangle(
+      width - 40,
+      36,
+      this._pauseBtnSize.w,
+      this._pauseBtnSize.h,
+      0x1a1a2e,
+      0.6,
+    );
+    const btn = this._pauseBtn;
+    btn.setStrokeStyle(2, 0xffffff, 0.6);
+    btn.setScrollFactor(0);
+    btn.setDepth(20);
+    btn.setInteractive({ useHandCursor: true });
+
+    this._pauseBtnText = this.add
+      .text(width - 40, 36, '☰', {
+        fontFamily: 'monospace',
+        fontSize: `${this._pauseBtnSize.font}px`,
+        color: '#ffffff',
+      })
+      .setOrigin(0.5)
+      .setScrollFactor(0)
+      .setDepth(21);
+
+    btn.on('pointerdown', () => this.togglePause());
+  }
+
+  /**
+   * Tombol fullscreen di samping tombol pause. Pakai Fullscreen API
+   * native (document.documentElement) supaya konsisten dengan
+   * auto-fullscreen di tap pertama (lihat PhaserGame.jsx) — jadi
+   * status fullscreen selalu sinkron dari sumber manapun ia dipicu.
+   * Catatan: Safari iOS tidak mendukung Fullscreen API sama sekali,
+   * jadi tombol ini otomatis tidak akan terlihat berefek di sana
+   * (browser diam-diam mengabaikan requestFullscreen) — solusi untuk
+   * iOS adalah lewat "Add to Home Screen" (lihat manifest.json).
+   */
+  createFullscreenButton(width) {
+    const wPx = 52;
+    const hPx = 40;
+    const fontPx = 18;
+    this._fsBtnSize = {
+      w: pxToWorld(this, wPx),
+      h: pxToWorld(this, hPx),
+      font: pxToWorld(this, fontPx),
+    };
+
+    // Diposisikan di sebelah kiri tombol pause; posisi akurat diatur
+    // ulang oleh _repositionUI() setiap create/resize.
+    this._fsBtn = this.add.rectangle(
+      width - 100,
+      36,
+      this._fsBtnSize.w,
+      this._fsBtnSize.h,
+      0x1a1a2e,
+      0.6,
+    );
+    this._fsBtn.setStrokeStyle(2, 0xffffff, 0.6);
+    this._fsBtn.setScrollFactor(0);
+    this._fsBtn.setDepth(20);
+    this._fsBtn.setInteractive({ useHandCursor: true });
+
+    this._fsBtnText = this.add
+      .text(width - 100, 36, '⛶', {
+        fontFamily: 'monospace',
+        fontSize: `${this._fsBtnSize.font}px`,
+        color: '#ffffff',
+      })
+      .setOrigin(0.5)
+      .setScrollFactor(0)
+      .setDepth(21);
+
+    this._fsBtn.on('pointerdown', () => this.toggleFullscreen());
+    this._updateFullscreenIcon();
+  }
+
+  toggleFullscreen() {
+    const isFs = !!(
+      document.fullscreenElement || document.webkitFullscreenElement
+    );
+    if (!isFs) {
+      const el = document.documentElement;
+      const req =
+        el.requestFullscreen ??
+        el.webkitRequestFullscreen ??
+        el.msRequestFullscreen;
+      req
+        ?.call(el)
+        .then(() => {
+          // Sama seperti overlay awal: sekalian coba kunci ke orientasi
+          // saat ini supaya tidak berubah tengah permainan. Gagal diam-
+          // diam di platform yang tidak mendukung (termasuk iOS Safari).
+          try {
+            const orientation = window.screen?.orientation;
+            const type = orientation?.type?.startsWith('portrait')
+              ? 'portrait'
+              : 'landscape';
+            orientation?.lock?.(type)?.catch(() => {});
+          } catch {
+            // abaikan
+          }
+        })
+        .catch(() => {
+          // Browser menolak/tidak didukung (mis. Safari iOS) — abaikan,
+          // tombol tetap ada tapi tidak berefek di browser tersebut.
+        });
+    } else {
+      const exit =
+        document.exitFullscreen ??
+        document.webkitExitFullscreen ??
+        document.msExitFullscreen;
+      exit?.call(document).catch(() => {});
+      try {
+        window.screen?.orientation?.unlock?.();
+      } catch {
+        // abaikan
+      }
+    }
+  }
+
+  /** Ganti ikon & warna tombol fullscreen sesuai status saat ini. */
+  _updateFullscreenIcon() {
+    if (!this._fsBtn || !this._fsBtnText) return;
+    const isFs = !!(
+      document.fullscreenElement || document.webkitFullscreenElement
+    );
+    this._fsBtnText.setText(isFs ? '⤢' : '⛶');
+    this._fsBtn.setFillStyle(isFs ? 0xffdd57 : 0x1a1a2e, isFs ? 0.85 : 0.6);
+    this._fsBtnText.setColor(isFs ? '#1a1a2e' : '#ffffff');
+  }
+
+  createPauseMenu() {
+    // setScrollFactor(0): wajib sekarang karena kamera mengikuti
+    // karakter (side-scroll) — tanpa ini menu jeda akan ikut bergeser
+    // mengikuti posisi kamera alih-alih diam di tengah layar.
+    //
+    // Sebelumnya seluruh isi menu ini dibangun SEKALI di world-space
+    // mentah (width/height = 1280x720) dan TIDAK PERNAH di-reposisi
+    // ulang saat resize/rotasi. Di layar portrait yang lebar area
+    // terlihatnya (visible bounds) jauh lebih sempit dari 1280 world
+    // unit, panel & tombol-tombol menu bisa terdorong ke luar area
+    // yang benar-benar terlihat/tersentuh — persis gejala "menu jeda
+    // tidak bisa diklik di portrait". Sekarang seluruh isi menu
+    // dibangun dari getVisibleBounds() dan dibangun ULANG (destroy +
+    // rebuild) setiap kali viewport berubah, sama seperti pola yang
+    // dipakai EpisodeSelectScene.
+    const container = this.add
+      .container(0, 0)
+      .setDepth(100)
+      .setVisible(false)
+      .setScrollFactor(0);
+    this.pauseMenuContainer = container;
+    this._buildPauseMenuContents();
+  }
+
+  _buildPauseMenuContents() {
+    const container = this.pauseMenuContainer;
+    if (!container) return;
+
+    // Hapus isi lama sebelum membangun ulang (dipakai saat resize).
+    container.removeAll(true);
+
+    const bounds = getVisibleBounds(this);
+    const cx = bounds.centerX;
+    const cy = bounds.centerY;
+
+    // Panel tidak boleh lebih lebar dari area yang benar-benar
+    // terlihat, supaya di portrait sempit sekalipun panel (dan semua
+    // tombol di dalamnya) tetap berada di dalam area yang bisa
+    // disentuh — bukan cuma di dalam area yang kelihatan.
+    const panelWidth = Math.min(420, bounds.width * 0.92);
+    const panelHeight = Math.min(400, bounds.height * 0.88);
+
+    const overlay = this.add
+      .rectangle(cx, cy, bounds.width, bounds.height, 0x000000, 0.7)
+      .setScrollFactor(0);
+    container.add(overlay);
+
+    const panel = this.add
+      .rectangle(cx, cy, panelWidth, panelHeight, 0x1a1a2e, 0.95)
+      .setScrollFactor(0);
+    panel.setStrokeStyle(2, 0xffdd57, 0.8);
+    container.add(panel);
+
+    const title = this.add
+      .text(cx, cy - panelHeight * 0.4, 'JEDA', {
+        fontFamily: '"Jersey 15", monospace',
+        fontSize: `${pxToWorld(this, 24)}px`,
+        color: '#ffdd57',
+      })
+      .setOrigin(0.5)
+      .setScrollFactor(0);
+    container.add(title);
+
+    // Label mute disimpan sebagai properti supaya teksnya bisa
+    // diperbarui setiap kali status mute berubah.
+    this.muteLabelText = this.add
+      .text(cx, cy + panelHeight * 0.325, this.getMuteLabel(), {
+        fontFamily: '"Pixelify Sans", monospace',
+        fontSize: `${pxToWorld(this, 14)}px`,
+        color: '#ffffff',
+        wordWrap: { width: panelWidth * 0.85 },
+        align: 'center',
+      })
+      .setOrigin(0.5)
+      .setScrollFactor(0)
+      .setInteractive({ useHandCursor: true });
+    this.muteLabelText.on('pointerdown', () => this.toggleMute());
+    container.add(this.muteLabelText);
+
+    const options = [
+      { label: 'Lanjutkan', action: () => this.togglePause() },
+      { label: 'Pilih Episode', action: () => this.goToEpisodeSelect() },
+      { label: 'Menu Utama (Lobby)', action: () => this.goToMainMenu() },
+      {
+        label: 'Mulai Ulang dari Awal',
+        action: () => this.restartFromBeginning(),
+      },
+    ];
+
+    const optionsTop = cy - panelHeight * 0.225;
+    const optionGap = panelHeight * 0.125;
+
+    options.forEach((opt, i) => {
+      const y = optionsTop + i * optionGap;
+      const optText = this.add
+        .text(cx, y, opt.label, {
+          fontFamily: '"Pixelify Sans", monospace',
+          fontSize: `${pxToWorld(this, 16)}px`,
+          color: '#ffffff',
+          wordWrap: { width: panelWidth * 0.85 },
+          align: 'center',
+        })
+        .setOrigin(0.5)
+        .setScrollFactor(0)
+        .setInteractive({ useHandCursor: true });
+
+      optText.on('pointerover', () => optText.setColor('#ffdd57'));
+      optText.on('pointerout', () => optText.setColor('#ffffff'));
+      optText.on('pointerdown', opt.action);
+
+      container.add(optText);
+    });
+
+    // PENTING: container.setScrollFactor(0) (dipanggil sekali di
+    // createPauseMenu()) HANYA mengubah scrollFactor container itu
+    // sendiri, BUKAN anak-anaknya di dalamnya — ini perilaku resmi
+    // Phaser (lihat docs Container#scrollFactorX). Anak-anak yang baru
+    // dibuat di atas (overlay, panel, title, muteLabelText, tiap
+    // optText) masih scrollFactor 1 secara default.
+    //
+    // Akibatnya: RENDER tetap kelihatan benar (diam di tengah layar,
+    // karena posisi digambar lewat matrix container yang sudah
+    // dibekukan), TAPI hit-test input Phaser mengecek scrollFactor
+    // milik masing-masing child sendiri (bukan milik container induk)
+    // untuk memutuskan apakah posisi tap perlu dikurangi
+    // camera.scrollX. Karena child masih dianggap scrollFactor 1, area
+    // yang bisa disentuh bergeser sejauh camera.scrollX saat menu
+    // dibuka — makin jauh karakter sudah berjalan, makin jauh pula
+    // list menu ini "meleset" dari yang terlihat di layar. Tombol
+    // pause tidak kena masalah ini karena dia bukan child container.
+    //
+    // updateChildren=true di sini men-cascade scrollFactor 0 ke semua
+    // child yang baru saja ditambahkan, menyamakan hit-test dengan
+    // hasil render.
+    container.setScrollFactor(0, 0, true);
+  }
+
+  /** Dipanggil dari _repositionUI() setiap resize/rotasi. */
+  _repositionPauseMenu() {
+    if (!this.pauseMenuContainer) return;
+    this._buildPauseMenuContents();
+  }
+
+  /**
+   * Posisikan ulang semua elemen UI (tombol sentuh, tombol pause) ke
+   * dalam area game yang benar-benar terlihat di layar. Diperlukan
+   * karena mode ENVELOP bisa memotong tepi dunia game jika rasio
+   * aspek viewport berbeda dari 16:9.
+   */
+  _repositionUI() {
+    const bounds = getVisibleBounds(this);
+    // Hitung ulang metrics (bukan pakai angka tetap) supaya saat layar
+    // di-resize/rotasi (mis. portrait -> landscape atau sebaliknya),
+    // ukuran tombol ikut menyesuaikan breakpoint lebar layar yang baru
+    // — bukan cuma posisinya yang dipindah tapi ukurannya tetap sama.
+    const { radiusWorld, gapWorld, marginWorld, fontWorld } =
+      this._getButtonMetrics();
+    this._buttonMetrics = { radiusWorld, gapWorld, marginWorld, fontWorld };
+
+    const buttonY = bounds.bottom - marginWorld - radiusWorld;
+    const leftX = bounds.left + marginWorld + radiusWorld;
+    const rightX = leftX + radiusWorld * 2 + gapWorld;
+    const runX = bounds.right - marginWorld - radiusWorld;
+    const jumpX = runX - radiusWorld * 2 - gapWorld;
+
+    this._repositionButton(
+      this.btnLeft,
+      leftX,
+      buttonY,
+      radiusWorld,
+      fontWorld,
+    );
+    this._repositionButton(
+      this.btnRight,
+      rightX,
+      buttonY,
+      radiusWorld,
+      fontWorld,
+    );
+    this._repositionButton(this.btnRun, runX, buttonY, radiusWorld, fontWorld);
+    this._repositionButton(
+      this.btnJump,
+      jumpX,
+      buttonY,
+      radiusWorld,
+      fontWorld,
+    );
+
+    // Pause button: pojok kanan atas area yang terlihat, ukurannya juga
+    // dihitung ulang dari CSS px supaya konsisten di semua layar.
+    const pauseWPx = 52;
+    const pauseHPx = 40;
+    const pauseFontPx = 20;
+    const pauseW = pxToWorld(this, pauseWPx);
+    const pauseH = pxToWorld(this, pauseHPx);
+    const pauseFont = pxToWorld(this, pauseFontPx);
+    const pauseX = bounds.right - marginWorld - pauseW / 2;
+    const pauseY = bounds.top + marginWorld + pauseH / 2;
+
+    if (this._pauseBtn) {
+      this._pauseBtn.setPosition(pauseX, pauseY);
+      this._pauseBtn.setSize(pauseW, pauseH);
+      // Sama seperti tombol sentuh lingkaran: hit area rectangle juga
+      // perlu di-refresh manual setelah setSize(), kalau tidak area
+      // klik tombol pause ini tetap memakai ukuran/posisi lama.
+      this._pauseBtn.disableInteractive();
+      this._pauseBtn.setInteractive({ useHandCursor: true });
+    }
+    if (this._pauseBtnText) {
+      this._pauseBtnText.setPosition(pauseX, pauseY);
+      this._pauseBtnText.setFontSize(pauseFont);
+    }
+
+    // Tombol fullscreen: persis di sebelah kiri tombol pause, dengan
+    // jarak antar tombol (gapWorld) yang sama seperti tombol gerak.
+    const fsW = pxToWorld(this, pauseWPx);
+    const fsH = pxToWorld(this, pauseHPx);
+    const fsFont = pxToWorld(this, 18);
+    const fsX = pauseX - pauseW / 2 - gapWorld - fsW / 2;
+    const fsY = pauseY;
+
+    if (this._fsBtn) {
+      this._fsBtn.setPosition(fsX, fsY);
+      this._fsBtn.setSize(fsW, fsH);
+      this._fsBtn.disableInteractive();
+      this._fsBtn.setInteractive({ useHandCursor: true });
+    }
+    if (this._fsBtnText) {
+      this._fsBtnText.setPosition(fsX, fsY);
+      this._fsBtnText.setFontSize(fsFont);
+    }
+
+    this._repositionPauseMenu();
+  }
+
+  /** Pindahkan + resize ulang tombol sentuh (circle + text) ke posisi/ukuran baru. */
+  _repositionButton(btn, x, y, radius, fontSize) {
+    if (!btn) return;
+    btn.circle.setPosition(x, y);
+    btn.circle.setRadius(radius);
+    // PENTING: setRadius() TIDAK otomatis memperbarui hit area interaktif
+    // — Phaser menyimpan hit area sebagai snapshot geometri pada saat
+    // setInteractive() pertama kali dipanggil. Kalau ini tidak
+    // di-refresh, area yang benar-benar bisa di-tap jadi tidak sinkron
+    // dengan ukuran visual tombol setelah resize/rotasi (gejala persis
+    // "tombol kelihatan tapi tidak bisa diklik" setelah ganti orientasi).
+    // Solusi paling aman: matikan lalu aktifkan ulang interactive supaya
+    // hit area dihitung ulang dari ukuran barunya.
+    btn.circle.disableInteractive();
+    btn.circle.setInteractive({ useHandCursor: true });
+    btn.text.setPosition(x, y);
+    if (fontSize) btn.text.setFontSize(fontSize);
+  }
+
+  getMuteLabel() {
+    return this.isMuted
+      ? '🔇 Suara: Mati (tap untuk nyalakan)'
+      : '🔊 Suara: Nyala (tap untuk matikan)';
+  }
+
+  toggleMute() {
+    this.isMuted = !this.isMuted;
+    this.audioManager?.setMasterVolume(this.isMuted ? 0 : 1);
+    this.muteLabelText?.setText(this.getMuteLabel());
+    setMuted(this.isMuted);
+  }
+
+  togglePause() {
+    this.isPaused = !this.isPaused;
+    this.pauseMenuContainer.setVisible(this.isPaused);
+
+    if (this.isPaused) {
+      // Hentikan dulu suara langkah kaki yang mungkin sedang berbunyi,
+      // dan bekukan fisika supaya karakter tidak diam-diam terus
+      // bergerak/lompat di belakang menu jeda.
+      // (Listener animationupdate otomatis berhenti saat animasi berhenti.)
+      this.physics.world.pause();
+    } else {
+      this.physics.world.resume();
+    }
+  }
+
+  goToEpisodeSelect() {
+    this.isPaused = false;
+    this.scene.start('EpisodeSelectScene');
+  }
+
+  goToMainMenu() {
+    this.isPaused = false;
+    this.scene.start('MenuScene');
+  }
+
+  restartFromBeginning() {
+    this.isPaused = false;
+    resetProgress();
+    this.scene.start('TitleScene');
+  }
+
+  update(time, delta) {
+    // ESC selalu dicek duluan, baik untuk membuka maupun menutup menu
+    // jeda, jadi harus di atas early-return berikutnya.
+    if (Phaser.Input.Keyboard.JustDown(this.pauseKey)) {
+      this.togglePause();
+    }
+    if (this.isPaused) {
+      return;
+    }
+
+    const jumpJustPressed =
+      Phaser.Input.Keyboard.JustDown(this.jumpKey) ||
+      this.touchState.jumpRequested;
+    this.touchState.jumpRequested = false;
+
+    const goLeftInput =
+      this.cursors.left.isDown ||
+      this.keysWASD.left.isDown ||
+      this.touchState.left;
+    const goRightInput =
+      this.cursors.right.isDown ||
+      this.keysWASD.right.isDown ||
+      this.touchState.right;
+    const currentDirection = goLeftInput ? -1 : goRightInput ? 1 : 0;
+
+    if (Phaser.Input.Keyboard.JustDown(this.shiftKeyLeft)) {
+      this.touchState.runToggle = !this.touchState.runToggle;
+    }
+    const isRunning = this.touchState.runToggle;
+    const speed = isRunning ? RUN_SPEED : WALK_SPEED;
+
+    if (this.btnRun && this.lastRunVisual !== isRunning) {
+      this.lastRunVisual = isRunning;
+      this.btnRun.circle.setFillStyle(
+        isRunning ? 0xffdd57 : 0x1a1a2e,
+        isRunning ? 0.85 : 0.55,
+      );
+      this.btnRun.text.setColor(isRunning ? '#1a1a2e' : '#ffffff');
+    }
+
+    if (jumpJustPressed && !this.isJumping) {
+      this.isJumping = true;
+      this.jumpLocksMovement = currentDirection === 0;
+      this.audioManager?.playJump();
+
+      if (this.jumpLocksMovement) {
+        this.player.play('jump', true);
+      } else {
+        this.player.anims.stop();
+        this.player.setTexture('player-jump-run-1');
+      }
+
+      this.tweens.add({
+        targets: this.player,
+        y: this.groundY - JUMP_HEIGHT,
+        duration: JUMP_DURATION / 2,
+        ease: 'Sine.easeOut',
+        yoyo: true,
+        onYoyo: () => {
+          if (!this.jumpLocksMovement) {
+            this.player.setTexture('player-jump-run-2');
+          }
+        },
+        onComplete: () => {
+          this.isJumping = false;
+          this.jumpLocksMovement = false;
+          this.player.y = this.groundY;
+          // Catatan: AudioManager belum punya bunyi khusus "mendarat",
+          // cuma playJump() untuk lepas landas. Kalau nanti mau
+          // ditambah, tinggal buat method playLand() baru di
+          // AudioManager.js lalu panggil di sini.
+        },
+      });
+    }
+
+    if (this.isJumping) {
+      if (this.jumpLocksMovement) {
+        this.player.setVelocityX(0);
+      } else {
+        if (goLeftInput) {
+          this.player.setVelocityX(-speed);
+          this.player.setFlipX(true);
+        } else if (goRightInput) {
+          this.player.setVelocityX(speed);
+          this.player.setFlipX(false);
+        } else {
+          this.player.setVelocityX(0);
+        }
+      }
+      this.player.setScale(this.spriteScale);
+      this._updatePortraitCamera();
+      this.onSceneUpdate(time, delta);
+      return;
+    }
+
+    const animKey = isRunning ? 'run' : 'walk';
+
+    if (currentDirection === -1) {
+      this.player.setVelocityX(-speed);
+      this.player.setFlipX(true);
+      this.player.setScale(this.spriteScale);
+      // SFX footstep di-trigger oleh listener animationupdate di
+      // _registerFootstepListeners(), bukan di sini — jadi ritme bunyi
+      // selalu selaras dengan frame animasi, bukan frame rate game.
+      this.player.play(animKey, true);
+    } else if (currentDirection === 1) {
+      this.player.setVelocityX(speed);
+      this.player.setFlipX(false);
+      this.player.setScale(this.spriteScale);
+      this.player.play(animKey, true);
+    } else {
+      this.player.setVelocityX(0);
+      this.player.stop();
+      this.player.setTexture('player-idle');
+      this.player.setScale(this.spriteScale);
+    }
+
+    this._updatePortraitCamera();
+    this.onSceneUpdate(time, delta);
+  }
+
+  /**
+   * Geser kamera secara MANUAL tiap frame — dipakai UNIVERSAL untuk
+   * semua orientasi (dulu cuma portrait, sekarang landscape juga pakai
+   * skema yang sama persis, sesuai permintaan supaya landscape ikut
+   * bisa "mentok baru kamera follow"). Clamp di sini pakai LEBAR AREA
+   * YANG BENAR-BENAR TERLIHAT (visBounds.width, hasil crop ENVELOP kalau
+   * ada), bukan lebar viewport kamera penuh seperti Camera.startFollow()
+   * bawaan Phaser.
+   *
+   * Kalau this.levelWidth <= visBounds.width (level sudah muat penuh di
+   * layar — kasus umum landscape dengan background natural yang pas/
+   * lebih sempit dari layar), minScroll & maxScroll di bawah otomatis
+   * sama-sama 0, jadi kamera otomatis diam — PERSIS seperti perilaku
+   * statis yang dulu di-hardcode khusus landscape, tapi sekarang
+   * didapat "gratis" dari rumus yang sama tanpa percabangan kode.
+   */
+  _updatePortraitCamera() {
+    if (!this.player) return;
+
+    const visBounds = getVisibleBounds(this);
+
+    // Batas scroll minimum & maksimum supaya jendela yang BENAR-BENAR
+    // terlihat (bukan lebar dunia game penuh) tidak pernah menampilkan
+    // area di luar level (kosong di kiri sebelum x=0, atau kosong di
+    // kanan setelah x=levelWidth). Kedua batas ini WAJIB ikut
+    // memperhitungkan visBounds.left (offset crop) — lihat penjelasan
+    // panjang di bawah pada targetScroll kalau masih bingung kenapa.
+    const minScroll = -visBounds.left;
+    const maxScroll = Math.max(
+      minScroll,
+      this.levelWidth - visBounds.left - visBounds.width,
+    );
+
+    // PENTING: target scroll harus memperhitungkan visBounds.left
+    // (offset crop ENVELOP), bukan cuma visBounds.width saja.
+    // Kalau ada crop tersisa (mis. dari pembulatan dynamicWidth di
+    // syncGameSizeToOrientation), world x=0 TIDAK berada di tepi kiri
+    // layar — ia berada visBounds.left unit di sebelah kiri area yang
+    // benar-benar terlihat. Rumus lama (`player.x - visBounds.width/2`)
+    // mengabaikan offset ini sama sekali, sehingga saat crop cukup
+    // besar, jendela kamera yang benar-benar tampil di layar bisa
+    // sama sekali tidak menyentuh posisi karakter — karakter jadi
+    // "hilang" (dirender di luar area yang ke-crop, walau clamp scroll
+    // itu sendiri terlihat masuk akal di atas kertas).
+    const targetScroll = Phaser.Math.Clamp(
+      this.player.x - visBounds.left - visBounds.width / 2,
+      minScroll,
+      maxScroll,
+    );
+
+    // Sedikit smoothing (lerp) supaya kamera tidak "nempel kaku" ke
+    // karakter — nilai 0.1 dipilih senada dengan lerp startFollow yang
+    // dipakai sebelumnya, terasa halus tapi tetap responsif.
+    const cam = this.cameras.main;
+    cam.scrollX = Phaser.Math.Linear(cam.scrollX, targetScroll, 0.1);
+  }
+}
