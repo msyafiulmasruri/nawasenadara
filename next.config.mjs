@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  allowedDevOrigins: ['192.168.1.22'],
+  allowedDevOrigins: ['most-citadel-distill.ngrok-free.dev'],
 };
 
 export default nextConfig;
